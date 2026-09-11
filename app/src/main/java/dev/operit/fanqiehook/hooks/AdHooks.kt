@@ -6,12 +6,24 @@ import dev.operit.fanqiehook.ModuleLog
 import io.github.libxposed.api.XposedInterface.Hooker
 
 /**
- * All ad-related hooks for `com.dragon.read` versionCode 73532.
+ * All ad-related hooks for `com.dragon.read` versionCodes 73532 (v7.3.5.32) and 73732 (v7.3.7.32).
  *
- * Every hook target below was validated against the APK (Fanqie v7.3.5.32, versionCode 73532;
- * see the reverse-engineering report § 5; smali line numbers are recorded in the static
- * evidence table § 6.1). Do not rename or remove methods without re-running reverse
- * engineering against the new APK first.
+ * Audit status (DEX-level, re-run for every supported versionCode — tooling and raw output live in
+ * `FANQIE/ADAPT_73532/` in the analysis workspace):
+ *
+ *   | versionCode | host                 | class/method targets                            | invoke sites |
+ *   |-------------|----------------------|-------------------------------------------------|--------------|
+ *   | 73532       | 番茄 com.dragon.read | 25/26 (only Hongguo-only HongguoBannerServiceImpl absent) | baseline |
+ *   | 73732       | 番茄 com.dragon.read | 25/26 (same Hongguo-only miss)                  | identical to 73532 |
+ *   | 73732       | 红果 com.phoenix.read| 26/26                                           | n/a |
+ *
+ * No hook target moved between 73532 and 73732, so one implementation covers both. What did drift:
+ *   - `SeriesPauseAdImpl.canShowPauseAd`'s obfuscated parameter (`so4.h` on Fanqie 73532 →
+ *     `vq4.i` on Fanqie 73732) — handled by [ClassResolver.findMethodIgnoringParams].
+ *   - The DexKit-resolved `NsAdConfigManagerApi` impl class (`fe3.a` → `lf3.a` on Fanqie,
+ *     `yb3.a` on Hongguo) — handled by resolving through the interface.
+ *   - One `video_reader_ad` string-literal reference disappeared in 73732; the position itself
+ *     is still present and still filtered.
  *
  * Position-string policy:
  *   The string parameter to [BLOCKED_POSITIONS] is matched against `String position` arguments
@@ -113,9 +125,10 @@ class AdHooks(
     //   SeriesPauseAdImpl.enablePauseAd()Z            (smali line 343)
     //   SeriesPauseAdImpl.canShowPauseAd(ti4.h)Z      (smali line 104)
     //
-    //   `canShowPauseAd` takes an obfuscated interface (ti4.h) as its single argument. The
-    //   interface name changes between Fanqie releases, so we resolve by name + return type
-    //   via [ClassResolver.findMethodIgnoringParams] to remain version-resilient.
+    //   `canShowPauseAd` takes an obfuscated interface (ti4.h / so4.h / vq4.i depending on
+    //   version and host) as its single argument. The interface name changes between Fanqie
+    //   releases, so we resolve by name + return type via [ClassResolver.findMethodIgnoringParams]
+    //   to remain version-resilient.
     // ─────────────────────────────────────────────────────────────────────────
 
     private fun installSeriesPauseHooks() {
@@ -140,8 +153,9 @@ class AdHooks(
     //
     //   Multiple call sites are hit. The second implementation lives on a class that implements
     //   `com.dragon.read.ad.manager.NsAdConfigManagerApi` and serves as the ad-config cache
-    //   front-end. The implementation class is obfuscated (`h83.a` in 73532, will likely be
-    //   renamed in future releases), so we resolve it through DexKit by interface name.
+    //   front-end. The implementation class is obfuscated (`fe3.a` in 73532, `lf3.a` in Fanqie
+    //   73732, `yb3.a` in Hongguo 73732 — it is renamed every release), so we resolve it through
+    //   DexKit by interface name.
     //   Hooking both gives defence-in-depth; the DexKit lookup degrades to a no-op if the bridge
     //   fails to initialise (logged WARN) or no impl class can be located.
     // ─────────────────────────────────────────────────────────────────────────
@@ -172,11 +186,23 @@ class AdHooks(
             deoptimize = false,
             shouldBlock = { args ->
                 val position = args.getOrNull(0)?.toString().orEmpty()
+                val source = args.getOrNull(1)
                 val blocked = position in BLOCKED_POSITIONS
                 if (blocked) {
+                    log.info("blocked ad position=$position source=$source via $className.checkAdAvailable")
+                } else if (LOG_UNLISTED_POSITIONS &&
+                    position.isNotEmpty() &&
+                    position !in PRESERVED_POSITIONS &&
+                    reportedPositions.add(position)
+                ) {
+                    // Debug-grade discovery: the ad-position namespace is server-driven and grows
+                    // silently between releases. Anything the block list does not know about (and
+                    // is not a deliberate keep) gets reported exactly once per process, so the next
+                    // adaptation round can extend BLOCKED_POSITIONS from real device data instead
+                    // of guesswork. Log-only: the return value is unaffected.
                     log.info(
-                        "blocked ad position=$position source=${args.getOrNull(1)} " +
-                            "via $className.checkAdAvailable"
+                        "unlisted ad position=$position source=$source via $className.checkAdAvailable " +
+                            "(not blocked; report upstream so it can be classified)"
                     )
                 }
                 blocked
@@ -366,10 +392,11 @@ class AdHooks(
         )
         // 短剧广告总开关 + 横屏插入广告开关
         //
-        // 验证结果 (versionCode 73532, 番茄+红果):
+        // 验证结果 (versionCodes 73532 与 73732, 番茄+红果 均有调用点):
         //   - q0() → ShortSeriesLandscapeInsertAdConfig.landscapeInsertAdEnable (横屏插入广告)
         //   - p()  → SeriesAdConfig.enableMultiSeriesFlowAd (系列信息流广告总开关)
         //   - p0() 不存在,旧版硬编码为 p0 的 hook 会静默 WARN 跳过
+        // 73732 复核: 两者调用点数量与 73532 完全一致 (p: 8, q0: 6), 无需改动。
         hooks.replaceBooleanFalse(
             id = "short-series-ad-enable",
             method = resolver.findMethod(
@@ -443,7 +470,25 @@ class AdHooks(
         // Passively displayed positions; USER-INITIATED reward / coin positions are intentionally
         // absent. Mirrors the previous AdHooks.kt whitelist. Additions are made in the report's
         // § 5.3 table; review before merging.
+        //
+        // Audited against both supported versionCodes (73532 and 73732): every string below is
+        // present in both APK string pools, so the filter keeps matching after an app update.
+        //
+        // `topview_main` / `topview_reader` used to be listed here, but neither string exists in
+        // ANY version's string pool — they could never match. TopView is cut structurally instead,
+        // by forcing NsAdImpl.checkCanShowTopViewInMainPage / checkCanShowTopViewInReader to false
+        // (both verified to still have live call sites in 73732). Removing the dead entries changes
+        // no behaviour.
+        //
+        // The second group below was derived by constant-flow analysis rather than by reading the
+        // string pool: every position constant that actually reaches `checkAdAvailable` (including
+        // through pass-through wrappers) was extracted, then each call site was disassembled to
+        // classify it as a passive slot or a user-initiated flow. Both versionCodes reach the gate
+        // with the same 29 constants, i.e. this was a long-standing coverage gap and not a
+        // 7.3.7.32 regression. The gate is demonstrably live in production:
+        //   "[INFO] blocked ad position=splash_ad source=Brand via lf3.a.checkAdAvailable"
         val BLOCKED_POSITIONS = setOf(
+            // ── reader / main-page slots (v0.1 set) ──────────────────────────────
             "splash_ad",
             "page_front_ad",
             "page_middle_ad",
@@ -453,14 +498,68 @@ class AdHooks(
             "reader_disconnected_ad",
             "reader_ad_for_sati",
             "video_reader_ad",
-            // Additional positions identified in the static call graph (see report § 5.2):
-            "topview_main",
-            "topview_reader",
-            "series_pause_ad"
+            "series_pause_ad",
+            // ── slots added in v0.6.0 from constant-flow evidence ───────────────
+            // 评论列表原生广告（NscommunityadImpl.isSatisfyFreq 频控前置检查）
+            "comment_list_ad",
+            // 短剧评论广告（r63.b / l63.d）
+            "series_comment_ad",
+            // 故事 / 短篇插页广告（StoryAdController.tryTriggerStoryAdInsert）
+            "story_ad",
+            // 创作者广告（com.dragon.read.ad.util.s0 → Args 构造）
+            "creator_ad",
+            // 短视频进度条插入广告（a93.p；埋点名为 pos=progress_ad）
+            "processed_ad",
+            // 横屏短剧插入广告 / 横屏短剧暂停广告（w73.k、h83.a）
+            "landscape_short_series_ad",
+            "landscape_short_series_pause_ad",
+            // 短剧信息流广告与短剧 banner（t83.l、BannerDependImpl.canRequestSeriesBanner）
+            "short_series_ad",
+            "short_series_banner",
+            // 听书信息流 / 贴片广告（AudioAdManager.checkInfoFlowAdAvailable / checkPatchAdAvailable）
+            "audio_info_flow_ad",
+            "audio_patch_ad"
         )
+
+        /**
+         * Positions that deliberately stay ENABLED. All of them are user-initiated reward / coin
+         * surfaces — blocking them would remove the user's ability to earn coins by watching a
+         * video, which this module explicitly preserves.
+         *
+         * Analysed call sites:
+         *   - `reader_gold_coin_popup` — 金币弹窗
+         *   - `video_tts_ad` / `video_voice_ad` — 听书激励入口（AudioInspireUtil.adUnavailable）
+         *   - `video_reward_gift_ad` — 激励视频礼包
+         *   - `video_reader_end_urge_update` — 看视频催更
+         *
+         * Listing them here (rather than only omitting them) keeps the intent explicit and stops
+         * the discovery logger from re-reporting them as unclassified.
+         */
+        val PRESERVED_POSITIONS = setOf(
+            "reader_gold_coin_popup",
+            "video_tts_ad",
+            "video_voice_ad",
+            "video_reward_gift_ad",
+            "video_reader_end_urge_update"
+        )
+
+        /**
+         * Log each previously-unseen ad position once per process (log-only; never changes the
+         * hook's return value). Purpose: the position namespace is server-driven and grows without
+         * any APK-side signal, so this turns every device into an instrument for finding the next
+         * gap. Disable if the extra INFO lines are unwanted.
+         */
+        const val LOG_UNLISTED_POSITIONS = true
 
         // Splash attribution is OFF by default. Flipping this to true causes AttributionManager
         // to skip install-source reporting, which may affect compliance. Review before shipping.
         const val ENABLE_ATTRIBUTION_SPLASH_BYPASS = false
     }
+
+    /**
+     * Positions already reported by [LOG_UNLISTED_POSITIONS]; process-scoped so a hot reload
+     * starts a fresh discovery pass. Concurrent because hook callbacks arrive on many threads.
+     */
+    private val reportedPositions: MutableSet<String> =
+        java.util.concurrent.ConcurrentHashMap.newKeySet()
 }
