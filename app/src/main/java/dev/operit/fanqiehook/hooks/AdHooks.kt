@@ -3,7 +3,6 @@ package dev.operit.fanqiehook.hooks
 import dev.operit.fanqiehook.ClassResolver
 import dev.operit.fanqiehook.HookManager
 import dev.operit.fanqiehook.ModuleLog
-import io.github.libxposed.api.XposedInterface.Hooker
 
 /**
  * All ad-related hooks for `com.dragon.read` versionCodes 73532 (v7.3.5.32) and 73732 (v7.3.7.32).
@@ -51,87 +50,8 @@ class AdHooks(
         installShortSeriesAdHooks()
         installSplashAdHooks()
         installFullScreenAdHooks()
-        installInstantRewardHooks()
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // 13. 激励秒领（实验性，默认关闭；当前实现**不生效**，见下）
-    //
-    //   目标：把「看 30 秒激励视频才发金币」变成「激励视频一露头就发奖并退出」。
-    //
-    //   ⚠️ 现状：**这一版实现无效**，默认关闭，保留代码仅为记录调研结论。
-    //   实测（番茄 7.3.7.32 / 73732）：hook 能装上、`onAdShow` 会被调用、
-    //   `onRewardVerifyCommon(true,false,0)` 也能成功执行且不抛异常，**但金币不增加**。
-    //
-    //   原因（原始指令转储确认，不是猜测）：`RewardDisplayImpl` 只是
-    //   `IRewardDisplayService` 的**桥接 + 埋点**实现，真正的发奖不在这里。
-    //
-    //     `onRewardVerifyCommon(Z Z I)V` 一共只有 45 条指令：
-    //       iget-object → 拼日志字符串 → 打日志(bs1.b#c) → 取单例(iv1.b#o()) → iput → return
-    //     即它是一个日志/状态记录函数。调它除了写一条日志什么都不会发生。
-    //
-    //   真实链路（逐层核验）：
-    //     App 任务层
-    //       → `lv1.s#b(Activity, uh.b, yh.e)`           拉起激励广告，yh.e 为回调接口
-    //            → `lv1.r$a implements yh.e`
-    //                 → `lv1.r$a#b(uh.k)`               SDK 回传结果（读字段 / iput-boolean / 转发）
-    //                      → `RewardDisplayImpl#onRewardVerify`（埋点，即上面那个空转）
-    //     发奖落在 `yh.e` 回调的**调用方**（App 任务层），且金币任务由**服务端权威校验**。
-    //
-    //   若要继续做，下一步是：挂 `lv1.s#b` 并自行合成一个成功的 `uh.k` 去驱动 `yh.e`。
-    //   但 `uh.k` 只有无参构造 + toString()，字段均为混淆继承，且服务端很可能拒收——
-    //   属于「投入大、成功率低」，在没有进一步证据前不默认开启。
-    //
-    //   风险（若将来启用）：这是代替广告平台上报「视频已完成」。广告主按完成量付费，
-    //   该行为在广告平台侧属于作弊，且番茄有服务端风控，存在账号被风控的风险。
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private fun installInstantRewardHooks() {
-        if (!ENABLE_INSTANT_REWARD) return
-
-        val impl = "com.dragon.read.ad.tomato.reward.impl.RewardDisplayImpl"
-        hooks.install(
-            id = "instant-reward",
-            method = resolver.findMethod(impl, "onAdShow", "boolean", "int", "Object", "Object"),
-            deoptimize = true,
-            hooker = Hooker { chain ->
-                val result = chain.proceed() // 先让广告正常展示/上报
-                val self = chain.thisObject
-                // 用真实参数而不是 null：onAdClose 内部会读第二参数，传 null 会抛
-                // InvocationTargetException（实测已复现）。
-                val adArgs = chain.args
-                val adObj = adArgs.getOrNull(3) ?: adArgs.getOrNull(2)
-                invokeRewardCallback(self, "onRewardVerifyCommon",
-                    arrayOf(java.lang.Boolean.TYPE, java.lang.Boolean.TYPE, Integer.TYPE),
-                    arrayOf(true, false, 0))
-                invokeRewardCallback(self, "onAdClose",
-                    arrayOf(java.lang.Boolean.TYPE, java.lang.Object::class.java),
-                    arrayOf(true, adObj))
-                result
-            },
-        )
-    }
-
-    /**
-     * 反射调用一个激励回调；失败只记日志，绝不抛出到宿主进程。
-     * 用反射而不是直接引用，是因为这些方法都在混淆类上、且优先按 `getDeclaredMethod` 命中，
-     * 签名对不上时只降级为「这条不生效」，不会影响其它 hook。
-     */
-    private fun invokeRewardCallback(
-        target: Any,
-        name: String,
-        paramTypes: Array<Class<*>>,
-        args: Array<Any?>
-    ) {
-        try {
-            val m = target.javaClass.getDeclaredMethod(name, *paramTypes)
-            m.isAccessible = true
-            m.invoke(target, *args)
-            log.info("instant-reward: invoked $name(${args.joinToString { it?.toString() ?: "null" }})")
-        } catch (t: Throwable) {
-            log.warn("instant-reward: $name failed (${t.javaClass.simpleName}: ${t.message})")
-        }
-    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // 12. 全屏广告 / 开屏的「根闸」
@@ -163,7 +83,7 @@ class AdHooks(
                 "Object"
             ),
             deoptimize = true,
-            hooker = Hooker {
+            body = {
                 log.info("blocked fullscreen-ad gate: NsUtilsDependImpl.canShowScreenAd")
                 false
             },
@@ -587,23 +507,23 @@ class AdHooks(
                 "com.dragon.read.report.PageRecorder"
             ),
             deoptimize = true,
-            hooker = Hooker { /* 不调用 proceed，直接阻断 */ },
+            body = { /* 不调用 proceed，直接阻断 */ },
         )
         // 双保险：即使 Activity 被其他途径拉起，广告 View 也不会挂载
         hooks.install(
             id = "splash-ad-brand-view",
             method = resolver.findMethod(splashActivity, "showBrandAdView", "android.view.View"),
-            hooker = Hooker { /* no-op */ },
+            body = { /* no-op */ },
         )
         hooks.install(
             id = "splash-ad-imc-view",
             method = resolver.findMethod(splashActivity, "showImcSplashView", "android.view.View"),
-            hooker = Hooker { /* no-op */ },
+            body = { /* no-op */ },
         )
         hooks.install(
             id = "splash-ad-natural-view",
             method = resolver.findMethod(splashActivity, "showNaturalAdView", "android.view.View"),
-            hooker = Hooker { /* no-op */ },
+            body = { /* no-op */ },
         )
 
         // ── 番茄侧的品牌开屏（补充闸门）──────────────────────────────────────
@@ -718,19 +638,6 @@ class AdHooks(
          * gap. Disable if the extra INFO lines are unwanted.
          */
         const val LOG_UNLISTED_POSITIONS = true
-
-        /**
-         * 激励秒领：**实验性，默认关闭**。
-         *
-         * 当前实现经实测**不生效**（hook 装上、回调能调到，但金币不增加）——原因见
-         * [installInstantRewardHooks] 的注释：可调用的那层只是埋点函数，真正的发奖在
-         * App 任务层的 `yh.e` 回调里且由服务端权威校验。保留代码是为了记录调研结论，
-         * 不是可用功能；在拿到可行方案前不要打开。
-         *
-         * 若将来启用，需知悉：这是代替广告平台上报「视频已完成」，广告主按完成量付费，
-         * 该行为在广告平台侧属于作弊，且番茄有服务端风控，存在账号被风控的风险。
-         */
-        const val ENABLE_INSTANT_REWARD = false
 
         // Splash attribution is OFF by default. Flipping this to true causes AttributionManager
         // to skip install-source reporting, which may affect compliance. Review before shipping.
